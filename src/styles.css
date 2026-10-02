@@ -133,3 +133,25 @@ kbd { padding: 2px 5px; border: 1px solid #5a6981; border-radius: 4px; color: wh
   .cue-row { grid-template-columns: 34px minmax(0, 1fr); }
   .cue-quick-actions { grid-column: 2; }
 }
+
+.master-card { margin-bottom: 6px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+.master-fps { display: flex; align-items: baseline; gap: 5px; color: #172741; font-size: 26px; font-weight: 750; font-variant-numeric: tabular-nums; }
+.master-fps small { color: #8793a7; font-size: 12px; font-weight: 600; }
+.master-meta { display: flex flex-direction: column; gap: 2px; margin: 4px 0 8px; color: #7b8799; font-size: 11px; }
+.master-file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.master-segments { display: flex flex-wrap; gap: 5px; margin-bottom: 8px; }
+.master-seg { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 999px; color: #33425b; background: #eef2f9; font-size: 11px; }
+.master-seg i { width: 6px; height: 6px; border-radius: 50%; background: #2f6fed; }
+.master-help { margin: 6px 0 8px; line-height: 1.5; }
+.master-actions { display: flex flex-wrap; gap: 4px; align-items: center; }
+.master-alert { margin-top: 10px; padding: 8px 10px; }
+.master-alert .el-alert__content { align-items: flex-start; }
+.master-error-hint { margin: 4px 0 6px; color: #ad6610; font-size: 11px; line-height: 1.5; }
+.unmatched-banner { color: #7a5a00; background: #fff6e0; border-bottom: 1px solid #f0d98a; }
+.unmatched-body { margin: 0 0 12px; color: #7c8799; font-size: 12px; line-height: 1.6; }
+.unmatched-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 0; border-bottom: 1px solid #edf0f4; }
+.unmatched-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.unmatched-info code { color: #66748a; font-size: 11px; font-variant-numeric: tabular-nums; }
+.unmatched-source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #1d2b41; font-size: 13px; }
+.unmatched-reason { color: #b36b00; font-size: 11px; }
+.unmatched-row .el-select { width: 260px; flex-shrink: 0; }

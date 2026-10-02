@@ -1,8 +1,9 @@
 import { defineStore } from 'pinia'
-import type { Cue, EditorDocument, Locale, Snapshot } from '../types'
-import { loadDocument, saveDocument } from '../utils/db'
+import type { Cue, EditorDocument, Locale, Master, Snapshot, UnmatchedCue } from '../types'
+import { loadDocument, loadMaster, saveDocument, saveMaster } from '../utils/db'
 import { makeId } from '../utils/id'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
+import { alignCues, backfillMaster, demoMaster, masterTemplate, parseMaster, round3 } from '../utils/master'
 import { translate, type MessageKey } from '../i18n'
 
 const DOCUMENT_ID = 'subtitle-dubbing-document'
@@ -60,6 +61,11 @@ export const useEditorStore = defineStore('subtitle-editor', {
     mutationSerial: 0,
     past: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
     future: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
+    master: null as Master | null,
+    unmatched: [] as UnmatchedCue[],
+    masterNotice: null as { key: MessageKey; values?: Record<string, string | number> } | null,
+    masterError: '' as string,
+    lastMaster: null as Master | null,
   }),
   getters: {
     t: (state) => (key: MessageKey, values?: Record<string, string | number>) => translate(state.document.language, key, values),
@@ -67,12 +73,16 @@ export const useEditorStore = defineStore('subtitle-editor', {
       return state.document.cues.find((cue) => cue.id === state.selectedCueId)
     },
     visibleCues(state): Cue[] {
-      return state.actorFilter === 'all'
-        ? state.document.cues
-        : state.document.cues.filter((cue) => cue.actorId === state.actorFilter)
+      return state.document.cues.filter((cue) => state.actorFilter === 'all' || cue.actorId === state.actorFilter)
     },
     totalDuration(state): number {
       return Math.max(10, ...state.document.cues.map((cue) => cue.end)) * 1.04
+    },
+    hasMaster(state): boolean {
+      return !!state.master
+    },
+    unmatchedCount(state): number {
+      return state.unmatched.length
     },
   },
   actions: {
@@ -87,6 +97,17 @@ export const useEditorStore = defineStore('subtitle-editor', {
         const saved = await saveDocument(plainDocument(this.document))
         this.document = saved
         this.lastSeenRevision = saved.revision
+      }
+      // 母版基准独立读取：读不出来不影响工作台，稍后可重新导入
+      try {
+        this.master = (await loadMaster()) ?? null
+      } catch (error) {
+        console.error('loadMaster', error)
+        this.master = null
+        this.masterError = 'masterReadError'
+      }
+      if (this.document.cues.length && !this.master) {
+        await this.backfillMaster()
       }
       this.initialized = true
       if ('BroadcastChannel' in window) {
@@ -194,6 +215,115 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.conflict = false
       this.saveState = 'saved'
       this.selectedCueId = latest.cues[0]?.id ?? null
+    },
+    async backfillMaster() {
+      const master = backfillMaster(this.document.cues)
+      try {
+        const saved = await saveMaster(master)
+        this.master = saved
+        this.masterNotice = { key: 'backfillNotice', values: { fps: saved.fps, segments: saved.segments.length } }
+      } catch (error) {
+        console.error('backfillMaster', error)
+        this.masterError = 'masterReadError'
+      }
+    },
+    async importMasterFile(file: File) {
+      const text = await file.text()
+      let newMaster: Master
+      try {
+        newMaster = parseMaster(text, file.name)
+      } catch (error) {
+        this.masterError = error instanceof Error ? error.message : 'masterParseError'
+        throw error
+      }
+      this.lastMaster = newMaster
+      this.masterError = ''
+      await this.applyMaster(newMaster)
+    },
+    async applyDemoMaster() {
+      const newMaster = demoMaster()
+      this.lastMaster = newMaster
+      this.masterError = ''
+      await this.applyMaster(newMaster)
+    },
+    async applyMaster(newMaster: Master) {
+      const oldMaster = this.master
+      const { updates, unmatched } = alignCues(this.document.cues, oldMaster, newMaster)
+      // 先落母版；失败则不动台词，保留重试入口
+      try {
+        await saveMaster(newMaster)
+      } catch (error) {
+        console.error('saveMaster', error)
+        this.masterError = 'masterReadError'
+        throw error
+      }
+      this.master = newMaster
+      this.unmatched = unmatched
+      this.masterError = ''
+      const total = this.document.cues.length
+      this.masterNotice = {
+        key: 'masterImported',
+        values: { fps: newMaster.fps, segments: newMaster.segments.length, matched: total - unmatched.length, total },
+      }
+      this.commit('master-align', (cues) => {
+        for (const cue of cues) {
+          const update = updates.get(cue.id)
+          if (update) {
+            cue.start = update.start
+            cue.end = update.end
+            cue.segmentId = update.segmentId
+          }
+        }
+      })
+    },
+    async retryMasterAlignment() {
+      if (!this.lastMaster) return
+      this.masterError = ''
+      await this.applyMaster(this.lastMaster)
+    },
+    assignCueSegment(cueId: string, segmentId: string) {
+      const item = this.unmatched.find((entry) => entry.cueId === cueId)
+      const segment = this.master?.segments.find((entry) => entry.id === segmentId)
+      if (!item || !segment || !this.master) return
+      const cue = this.document.cues.find((entry) => entry.id === cueId)
+      if (!cue) return
+      let start: number
+      let end: number
+      if (item.rStart !== undefined && item.rEnd !== undefined) {
+        const startFrame = Math.round(segment.start * this.master.fps)
+        const endFrame = Math.round(segment.end * this.master.fps)
+        start = round3(Math.round(startFrame + item.rStart * (endFrame - startFrame)) / this.master.fps)
+        end = round3(Math.round(startFrame + item.rEnd * (endFrame - startFrame)) / this.master.fps)
+      } else {
+        start = round3(segment.start)
+        end = Math.min(round3(segment.end), round3(segment.start) + (cue.end - cue.start))
+      }
+      this.commit('master-assign', (cues) => {
+        const target = cues.find((entry) => entry.id === cueId)
+        if (!target) return
+        target.start = start
+        target.end = end
+        target.segmentId = segmentId
+      })
+      this.unmatched = this.unmatched.filter((entry) => entry.cueId !== cueId)
+    },
+    dismissUnmatched() {
+      this.unmatched = []
+    },
+    clearMasterNotice() {
+      this.masterNotice = null
+    },
+    clearMasterError() {
+      this.masterError = ''
+    },
+    downloadMasterTemplate() {
+      const blob = new Blob([masterTemplate()], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = 'master-template.json'
+      anchor.click()
+      URL.revokeObjectURL(url)
     },
     undo() {
       const entry = this.past.pop()

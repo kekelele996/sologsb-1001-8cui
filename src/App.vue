@@ -1,18 +1,21 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Clock, Delete, DocumentCopy, Download, EditPen, Files, Lock, MagicStick, Monitor,
+  Clock, Delete, DocumentCopy, Download, EditPen, Files, Film, Lock, MagicStick, Monitor,
   RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from './store/editor'
-import type { Cue, CueConflict } from './types'
+import type { Cue, CueConflict, UnmatchedCue } from './types'
 import { formatTime } from './utils/subtitle'
+import { unmatchedReasonKey } from './utils/master'
 
 const store = useEditorStore()
-const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter } = storeToRefs(store)
+const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter, master, unmatched, masterNotice, masterError } = storeToRefs(store)
 const fileInput = ref<HTMLInputElement>()
+const masterFileInput = ref<HTMLInputElement>()
+const unmatchedDialog = ref(false)
 const snapshotDialog = ref(false)
 const snapshotName = ref('')
 const search = ref('')
@@ -79,6 +82,34 @@ async function importFile(event: Event) {
     input.value = ''
   }
 }
+async function importMasterFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    await store.importMasterFile(file)
+  } catch {
+    ElMessage.error(store.t((store.masterError || 'masterParseError') as 'masterParseError'))
+  } finally {
+    input.value = ''
+  }
+}
+async function applyDemoMaster() {
+  try {
+    await store.applyDemoMaster()
+  } catch {
+    ElMessage.error(store.t((store.masterError || 'masterReadError') as 'masterReadError'))
+  }
+}
+const cueById = (id: string) => project.value.cues.find((cue) => cue.id === id)
+function unmatchedReasonText(item: UnmatchedCue) {
+  const key = unmatchedReasonKey(item.reason)
+  if (item.reason === 'segment-gone') return store.t(key as 'unmatchedSegmentGone', { segment: item.oldSegmentId ?? '' })
+  return store.t(key as 'unmatchedNoBaseline')
+}
+watch(unmatched, (list) => {
+  if (list.length) unmatchedDialog.value = true
+}, { deep: true })
 function requestDelete(id: string) {
   ElMessageBox.confirm(store.t('confirmDelete'), { type: 'warning', confirmButtonText: store.t('delete') })
     .then(() => store.deleteCue(id))
@@ -163,8 +194,50 @@ const handleOffline = () => setOnline(false)
       </div>
     </div>
 
+    <div v-if="unmatched.length" class="conflict-banner unmatched-banner">
+      <div>
+        <strong>{{ store.t('unmatchedTitle', { count: unmatched.length }) }}</strong>
+        <span>{{ store.t('unmatchedBody') }}</span>
+      </div>
+      <div class="conflict-actions">
+        <el-button size="small" type="warning" @click="unmatchedDialog = true">{{ store.t('reviewUnmatched') }}</el-button>
+      </div>
+    </div>
+
     <main class="workspace">
       <aside class="left-panel panel">
+        <section class="master-card">
+          <div class="section-heading">
+            <span><el-icon><Film /></el-icon>{{ store.t('master') }}</span>
+            <el-tag v-if="master?.backfilled" size="small" type="info">{{ store.t('backfilled') }}</el-tag>
+          </div>
+          <template v-if="master">
+            <div class="master-fps">{{ master.fps }}<small>fps</small></div>
+            <div class="master-meta">
+              <span>{{ store.t('masterSegmentCount', { count: master.segments.length }) }}</span>
+              <span v-if="master.fileName" class="master-file" :title="master.fileName">{{ master.fileName }}</span>
+            </div>
+            <div class="master-segments">
+              <span v-for="seg in master.segments" :key="seg.id" class="master-seg" :title="`${formatTime(seg.start)} → ${formatTime(seg.end)}`"><i />{{ seg.name }}</span>
+            </div>
+          </template>
+          <p v-else class="section-note">{{ store.t('noMaster') }}</p>
+          <p class="section-note master-help">{{ store.t('masterHelp') }}</p>
+          <div class="master-actions">
+            <el-button size="small" :icon="UploadFilled" @click="masterFileInput?.click()">{{ master ? store.t('reimportMaster') : store.t('importMaster') }}</el-button>
+            <el-button size="small" text @click="applyDemoMaster">{{ store.t('demoMaster') }}</el-button>
+            <el-button size="small" text @click="store.downloadMasterTemplate">{{ store.t('masterTemplate') }}</el-button>
+          </div>
+          <input ref="masterFileInput" class="file-input" type="file" accept=".json,application/json" @change="importMasterFile" />
+          <el-alert v-if="masterNotice" class="master-alert" type="success" :closable="true" @close="store.clearMasterNotice">
+            <template #title>{{ store.t(masterNotice.key, masterNotice.values) }}</template>
+          </el-alert>
+          <el-alert v-if="masterError" class="master-alert" type="error" :closable="true" @close="store.clearMasterError">
+            <template #title>{{ store.t(masterError as 'masterReadError') }}</template>
+            <div class="master-error-hint">{{ store.t('masterErrorHint') }}</div>
+            <el-button size="small" @click="store.retryMasterAlignment">{{ store.t('retry') }}</el-button>
+          </el-alert>
+        </section>
         <section>
           <div class="section-heading">
             <span><el-icon><Files /></el-icon>{{ store.t('actors') }}</span>
@@ -328,6 +401,31 @@ const handleOffline = () => setOnline(false)
         <p v-if="!project.snapshots.length" class="empty-state">{{ store.t('noSnapshots') }}</p>
       </div>
       <template #footer><el-button type="primary" @click="createSnapshot">{{ store.t('snapshot') }}</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="unmatchedDialog" :title="store.t('unmatchedTitle', { count: unmatched.length })" width="720px">
+      <p class="unmatched-body">{{ store.t('unmatchedBody') }}</p>
+      <div v-for="item in unmatched" :key="item.cueId" class="unmatched-row">
+        <div class="unmatched-info">
+          <code>{{ formatTime(cueById(item.cueId)?.start ?? 0) }} → {{ formatTime(cueById(item.cueId)?.end ?? 0) }}</code>
+          <span class="unmatched-source">{{ cueById(item.cueId)?.source }}</span>
+          <small class="unmatched-reason">{{ unmatchedReasonText(item) }}</small>
+        </div>
+        <el-select
+          :model-value="cueById(item.cueId)?.segmentId ?? ''"
+          :placeholder="store.t('assignSegment')"
+          size="small"
+          filterable
+          @change="store.assignCueSegment(item.cueId, String($event))"
+        >
+          <el-option v-for="seg in master?.segments" :key="seg.id" :label="`${seg.name} · ${formatTime(seg.start)} → ${formatTime(seg.end)}`" :value="seg.id" />
+        </el-select>
+      </div>
+      <p v-if="!unmatched.length" class="empty-state">{{ store.t('matchedAll') }}</p>
+      <template #footer>
+        <el-button @click="store.dismissUnmatched(); unmatchedDialog = false">{{ store.t('leaveUnmatched') }}</el-button>
+        <el-button type="primary" @click="unmatchedDialog = false">{{ store.t('done') }}</el-button>
+      </template>
     </el-dialog>
   </div>
 </template>

@@ -12,6 +12,33 @@ export interface Cue {
   termIds: string[]
   status: CueStatus
   locked: boolean
+  segmentId?: string
+}
+
+export interface MasterSegment {
+  id: string
+  name: string
+  start: number
+  end: number
+}
+
+export interface Master {
+  id: string
+  fileName: string
+  fps: number
+  importedAt: number
+  backfilled?: boolean
+  segments: MasterSegment[]
+}
+
+export type UnmatchedReason = 'no-baseline' | 'no-old-segment' | 'segment-gone' | 'zero-segment'
+
+export interface UnmatchedCue {
+  cueId: string
+  reason: UnmatchedReason
+  oldSegmentId?: string
+  rStart?: number
+  rEnd?: number
 }
 
 export interface Actor {
