@@ -7,10 +7,14 @@ import {
   RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from './store/editor'
+import { useMasterStore } from './store/master'
+import MasterPanel from './components/MasterPanel.vue'
 import type { Cue, CueConflict } from './types'
 import { formatTime } from './utils/subtitle'
+import { segmentOnScreenStart, masterDuration } from './utils/master'
 
 const store = useEditorStore()
+const masterStore = useMasterStore()
 const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter } = storeToRefs(store)
 const fileInput = ref<HTMLInputElement>()
 const snapshotDialog = ref(false)
@@ -30,6 +34,16 @@ const saveLabel = computed(() => ({
 }[saveState.value]))
 const actorColor = (id: string) => project.value.actors.find((actor) => actor.id === id)?.color ?? '#6d7b91'
 const actorName = (id: string) => project.value.actors.find((actor) => actor.id === id)?.name ?? '—'
+const segmentMarkers = computed(() => {
+  const master = masterStore.activeMaster
+  if (!master) return []
+  const span = Math.max(store.totalDuration, masterDuration(master))
+  return master.segments.map((segment) => ({
+    id: segment.id,
+    name: segment.name,
+    left: (segmentOnScreenStart(segment, master) / span) * 100,
+  }))
+})
 const statusLabel = (status: Cue['status']) => store.t(status)
 const statusType = (status: Cue['status']) => status === 'reviewed' ? 'success' : status === 'issue' ? 'danger' : 'info'
 
@@ -70,8 +84,21 @@ async function importFile(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
+  const text = await file.text()
+  // 剪辑侧母版清单（fps= 开头）交给母版流程；SRT / 剧本走工作台导入
+  if (/^\s*(fps|frame[-_ ]?rate)\s*[=:]/im.test(text)) {
+    try {
+      const result = await masterStore.importMaster(text, file.name, true, store.document.cues)
+      ElMessage.success(store.t('masterImportDone', { name: result.master.name, count: result.count, unmatched: result.unmatched }))
+    } catch {
+      ElMessage.error(store.t('masterImportError'))
+    } finally {
+      input.value = ''
+    }
+    return
+  }
   try {
-    const count = store.importText(await file.text(), file.name)
+    const count = store.importText(text, file.name)
     ElMessage.success(store.t('importDone', { count }))
   } catch {
     ElMessage.error(store.t('importError'))
@@ -165,6 +192,7 @@ const handleOffline = () => setOnline(false)
 
     <main class="workspace">
       <aside class="left-panel panel">
+        <MasterPanel />
         <section>
           <div class="section-heading">
             <span><el-icon><Files /></el-icon>{{ store.t('actors') }}</span>
@@ -219,6 +247,7 @@ const handleOffline = () => setOnline(false)
                 :style="{ left: `${(cue.start / store.totalDuration) * 100}%`, width: `${Math.max(1.8, ((cue.end - cue.start) / store.totalDuration) * 100)}%`, borderColor: actorColor(cue.actorId) }"
                 :title="`${formatTime(cue.start)} · ${cue.source}`" @click="store.selectCue(cue.id)"
               ><span>{{ actorName(cue.actorId).split('/')[0] }}</span><b>{{ cue.target || cue.source }}</b></button>
+              <span v-for="marker in segmentMarkers" :key="marker.id" class="segment-marker" :style="{ left: `${marker.left}%` }" :data-label="marker.name"><i />{{ marker.name }}</span>
               <div class="timeline-ruler"><span v-for="tick in [0, 15, 30, 45, 60]" :key="tick" :style="{ left: `${(tick / store.totalDuration) * 100}%` }">{{ tick }}s</span></div>
             </div>
           </div>

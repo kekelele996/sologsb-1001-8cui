@@ -4,6 +4,8 @@ import { loadDocument, saveDocument } from '../utils/db'
 import { makeId } from '../utils/id'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
 import { translate, type MessageKey } from '../i18n'
+import { anchorFromLanding, backfillMaster, type LandingResult } from '../utils/master'
+import { useMasterStore } from './master'
 
 const DOCUMENT_ID = 'subtitle-dubbing-document'
 let saveTimer: ReturnType<typeof setTimeout> | undefined
@@ -11,6 +13,17 @@ let channel: BroadcastChannel | undefined
 
 const cloneCues = (cues: Cue[]): Cue[] => JSON.parse(JSON.stringify(cues)) as Cue[]
 const plainDocument = (document: EditorDocument): EditorDocument => JSON.parse(JSON.stringify(document)) as EditorDocument
+
+/** 在当前母版下，为缺锚点的台词按落地时间补记段落与帧锚点（导入、拆分、合并后调用） */
+const fillAnchors = (cues: Cue[]) => {
+  const master = useMasterStore().activeMaster
+  if (!master) return
+  for (const cue of cues) {
+    if (cue.segmentId && cue.anchorFrame !== undefined && cue.durationFrames !== undefined) continue
+    const anchor = anchorFromLanding(cue, master)
+    if (anchor) Object.assign(cue, anchor)
+  }
+}
 
 const createDefaultDocument = (): EditorDocument => ({
   id: DOCUMENT_ID,
@@ -79,6 +92,8 @@ export const useEditorStore = defineStore('subtitle-editor', {
     async initialize() {
       if (this.initialized) return
       this.online = navigator.onLine
+      const masterStore = useMasterStore()
+      await masterStore.initialize().catch(() => undefined)
       const stored = await loadDocument(DOCUMENT_ID)
       if (stored) {
         this.document = stored
@@ -88,6 +103,10 @@ export const useEditorStore = defineStore('subtitle-editor', {
         this.document = saved
         this.lastSeenRevision = saved.revision
       }
+      // 已有数据没记基准：先按 24fps 回填母版与帧锚点，再启用换母版
+      await this.backfillBaseline(masterStore)
+      // 换母版的落地动作由母版作业回调到工作台：只动落地时间与锚点，进撤销历史
+      masterStore.applyLandings = (landings, firstBatch) => this.applyLandings(landings, firstBatch)
       this.initialized = true
       if ('BroadcastChannel' in window) {
         channel = new BroadcastChannel('sologsb-1001-document')
@@ -111,6 +130,90 @@ export const useEditorStore = defineStore('subtitle-editor', {
     },
     setOnline(value: boolean) {
       this.online = value
+    },
+    /** 老数据回填：24fps 母版 + 每条台词的段落与帧锚点。母版读不出来时不影响工作台编辑 */
+    async backfillBaseline(masterStore = useMasterStore()) {
+      if (masterStore.backfilled && masterStore.activeMaster) {
+        this.syncMissingAnchors(masterStore)
+        return
+      }
+      const { master, anchors } = backfillMaster(this.document.cues)
+      this.document.cues = this.document.cues.map((cue) => {
+        const anchor = anchors.get(cue.id)
+        return anchor ? { ...cue, ...anchor } : cue
+      })
+      await masterStore.registerBackfilled(master).catch(() => undefined)
+      // 迁移结果立即落库，不等自动保存防抖
+      this.document.updatedAt = Date.now()
+      const saved = await saveDocument(plainDocument(this.document), this.lastSeenRevision).catch(() => undefined)
+      if (saved) {
+        this.document.revision = saved.revision
+        this.document.updatedAt = saved.updatedAt
+        this.lastSeenRevision = saved.revision
+        this.saveState = 'saved'
+      } else {
+        this.markChanged('backfill-baseline')
+      }
+    },
+    /** 当前母版下，为没有锚点的台词（如导入后落在某段内）补锚点 */
+    syncMissingAnchors(masterStore = useMasterStore()) {
+      if (!masterStore.activeMaster) return
+      let changed = false
+      this.document.cues = this.document.cues.map((cue) => {
+        if (cue.segmentId && cue.anchorFrame !== undefined && cue.durationFrames !== undefined) return cue
+        const anchor = anchorFromLanding(cue, masterStore.activeMaster!)
+        if (!anchor) return cue
+        changed = true
+        return { ...cue, ...anchor }
+      })
+      if (changed) this.markChanged('sync-anchors')
+    },
+    /**
+     * 母版对齐落地：只改 start/end 与帧锚点，不动译文、角色、状态、锁定。
+     * 锁定和已确认的台词同样跟着走；内容由工作台持有，因此不被触碰。
+     */
+    applyLandings(landings: Map<string, LandingResult>, pushHistory: boolean) {
+      if (!landings.size) return
+      if (pushHistory) {
+        const before = cloneCues(this.document.cues)
+        this.document.cues = this.landingPatched(landings)
+        this.past.push({ label: 'align-master', cues: before, selectedCueId: this.selectedCueId })
+        if (this.past.length > 60) this.past.shift()
+        this.future = []
+      } else {
+        this.document.cues = this.landingPatched(landings)
+      }
+      this.markChanged('align-master')
+    },
+    /** 对齐批次全部跑完后立即落库（避免最后一批丢在防抖窗口里） */
+    async flushAfterAlignment() {
+      if (saveTimer) clearTimeout(saveTimer)
+      await this.persist('align-master')
+    },
+    landingPatched(landings: Map<string, LandingResult>): Cue[] {
+      return this.document.cues.map((cue) => {
+        const landing = landings.get(cue.id)
+        return landing
+          ? { ...cue, start: landing.start, end: landing.end, segmentId: landing.segmentId, anchorFrame: landing.anchorFrame, durationFrames: landing.durationFrames }
+          : cue
+      })
+    },
+    /** 手工微调落地时间后，把工作台锚点同步到当前母版帧；落不进段落则清空锚点 */
+    resyncCueAnchor(id: string) {
+      const masterStore = useMasterStore()
+      const master = masterStore.activeMaster
+      const cue = this.document.cues.find((item) => item.id === id)
+      if (!master || !cue) return
+      const anchor = anchorFromLanding(cue, master)
+      if (anchor) {
+        cue.segmentId = anchor.segmentId
+        cue.anchorFrame = anchor.anchorFrame
+        cue.durationFrames = anchor.durationFrames
+      } else {
+        cue.segmentId = undefined
+        cue.anchorFrame = undefined
+        cue.durationFrames = undefined
+      }
     },
     selectCue(id: string | null) {
       this.selectedCueId = id
@@ -217,6 +320,8 @@ export const useEditorStore = defineStore('subtitle-editor', {
         if (!cue || cue.locked) return
         Object.assign(cue, patch)
       })
+      // 手工微调落地时间：工作台锚点跟着当前母版帧重记
+      if (patch.start !== undefined || patch.end !== undefined) this.resyncCueAnchor(id)
     },
     markStatus(id: string, status: Cue['status']) {
       this.updateCue(id, { status }, `status:${status}`)
@@ -249,6 +354,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
         cue.target = cue.target.slice(0, targetMid).trim()
         cue.status = 'draft'
         cues.splice(index + 1, 0, second)
+        fillAnchors([cue, second])
       }, secondId)
     },
     mergeNext(id: string) {
@@ -264,7 +370,11 @@ export const useEditorStore = defineStore('subtitle-editor', {
         item.target = `${item.target} ${following.target}`.trim()
         item.termIds = [...new Set([...item.termIds, ...following.termIds])]
         item.status = 'draft'
+        delete item.segmentId
+        delete item.anchorFrame
+        delete item.durationFrames
         cues.splice(index + 1, 1)
+        fillAnchors([item])
       }, id)
     },
     moveCue(id: string, direction: -1 | 1) {
@@ -304,6 +414,7 @@ export const useEditorStore = defineStore('subtitle-editor', {
       if (!cues.length) throw new Error('EMPTY_IMPORT')
       this.commit('import', (current) => {
         current.splice(0, current.length, ...cues)
+        fillAnchors(current)
       }, cues[0].id)
       return cues.length
     },
